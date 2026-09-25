@@ -5,7 +5,7 @@ Snowflake account, and submit a short supervised fine-tuning job.
 
 1. [Check the prerequisites](prerequisites.md) for account access,
    authentication, and GPU capacity.
-2. [Set up the client](setup.md), create a connection configuration, and verify
+2. [Set up the client](setup.md), configure a Snowflake connection, and verify
    access to the training endpoint.
 3. [Run a quick SFT job](first-sft-run.md) with the conversational training
    recipe.

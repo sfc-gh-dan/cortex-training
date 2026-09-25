@@ -95,12 +95,7 @@ https://{account_host}/api/v2/databases/{database}/schemas/{schema}/{endpoint}
 `CortexTrainingClient` defaults `endpoint` to `cortex-training`.
 
 ```python
-client = CortexTrainingClient.from_pat(
-    host=HOST,
-    pat=PAT,
-    database=DATABASE,
-    schema=SCHEMA,
-)
+client = CortexTrainingClient.from_connection_name("training")
 ```
 
 The SQL statements API used by execution-log download is outside this prefix:
@@ -112,9 +107,21 @@ https://{account_host}/api/v2/statements
 If you point the client at a server that exposes the endpoint under a
 different name, pass it explicitly: `endpoint="my-endpoint-name"`.
 
-### 2.2 PAT authentication
+### 2.2 Authentication
 
-`CortexTrainingClient.from_pat(...)` sends:
+`CortexTrainingClient.from_connection_name(...)` uses the Snowflake
+Connector's resolved REST origin and live session token:
+
+```http
+Authorization: Snowflake Token="<session-token>"
+```
+
+The client reconnects once and replays the request when Snowflake explicitly
+reports that the session token expired. Named profiles and the configured
+default profile are supported.
+
+Direct PAT compatibility is available through
+`CortexTrainingClient.from_pat(...)`, which sends:
 
 ```http
 Authorization: Bearer <PAT>
@@ -1595,10 +1602,10 @@ serve empty, non-EOF pages during placement while the pod is still appearing.
 `fetch_execution_logs(job_id)`:
 
 1. Calls `GET /{job_id}/experiment-run`.
-2. Resolves the current user and role through the SQL statements API. The
-   connector `account` is the PAT host (locator vs account-name hosts must not
-   be mixed).
-3. Opens an explicitly PAT-authenticated Snowflake Connector session.
+2. For profile clients, opens an independent connection from the same
+   Snowflake profile.
+3. For direct PAT clients, resolves the current user and role through the SQL
+   statements API and opens an equivalent Connector session.
 4. Uses experiment artifact `LIST` and `GET` to download every object below a
    `/_logs/{sub_job_id}/` subtree.
 

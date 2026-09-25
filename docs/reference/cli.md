@@ -81,6 +81,8 @@ positional `JOB_ID` after the subcommand.
 ### [Connection](#connection-config)
 
 ```bash
+cortex-training --connection training list    # Use a Snowflake profile
+cortex-training list                          # Use the configured default profile
 cortex-training login config.json             # Remember config for future commands
 cortex-training login --config config.json    # Equivalent login syntax
 cortex-training --config config.json list     # Use config for one command
@@ -179,14 +181,39 @@ cortex-training fwd-bwd --help
 
 `cortex-training` submits and manages Cortex Training jobs through the Cortex
 Training REST endpoint.
-The normal workflow is:
+The Snowflake-native workflow uses the same connection profiles as the Python
+Connector and Snowflake CLI:
 
-1. Create a connection config JSON.
-2. Run `cortex-training login config.json` once.
-3. Use `cortex-training list`, `submit`, `get`, `cancel`, `wait`, and
-   `capacity` without passing connection flags every time.
+```toml
+# ~/.snowflake/connections.toml
+[training]
+account = "ORG-ACCOUNT"
+host = "ACCOUNT.snowflakecomputing.com"
+user = "USER"
+authenticator = "programmatic_access_token"
+token = "YOUR_PROGRAMMATIC_ACCESS_TOKEN"
+database = "CORTEX_TRAINING_DB"
+schema = "PUBLIC"
+```
 
-### Connection Config
+Protect files containing credentials, then select the named profile:
+
+```bash
+chmod 600 ~/.snowflake/connections.toml
+cortex-training --connection training list
+```
+
+`cortex-training list` with no connection arguments uses the
+Connector-configured default profile. Set
+`SNOWFLAKE_DEFAULT_CONNECTION_NAME=training`, configure
+`default_connection_name = "training"` in Snowflake's `config.toml`, or name
+the connection `[default]`.
+
+Profile lookup is a fallback. An explicit or remembered legacy JSON config, or
+a complete direct `--base-url` / `--host` + `--pat` connection, continues to
+win. This preserves existing scripts.
+
+### Legacy Connection Config
 
 For Snowflake PAT auth, use `host` for the account hostname. Do not use
 `base_url` for Snowflake PAT auth.
@@ -223,7 +250,7 @@ account, use `base_url` with an explicit scheme. This skips PAT auth:
 }
 ```
 
-### Login
+### Legacy Login
 
 Login validates the config and stores only the config path, not the config
 contents:
@@ -526,11 +553,9 @@ URIs for each reconstructed file.
 
 ### Log TUI
 
-`cortex-training tui` is a read-only terminal UI for tailing a running job's logs
-live. It reuses the same connection handling as `cortex-training` — login state,
-`--config` /
-`CORTEX_TRAINING_CONFIG`, the `CORTEX_TRAINING_*` / `SNOWFLAKE_*` env vars, or explicit
-flags. So once you've run `cortex-training login config.json` you can just launch it:
+`cortex-training tui` is a read-only terminal UI for tailing a running job's
+logs live. It uses the same connection handling and fallback order as the CLI,
+including named and configured-default Snowflake profiles:
 
 ```bash
 cortex-training tui                 # opens a job picker
@@ -540,6 +565,7 @@ cortex-training tui JOB_ID          # opens that job's logs directly
 Without login state, pass connection details the same way as the CLI:
 
 ```bash
+cortex-training tui JOB_ID --connection training
 cortex-training tui JOB_ID --config config.json
 cortex-training tui JOB_ID --host ACCOUNT.snowflakecomputing.com --pat YOUR_PAT \
   --database CORTEX_TRAINING_DB --schema PUBLIC --endpoint cortex-training
@@ -612,6 +638,8 @@ usage: cortex-training --job JOB_ID fwd-bwd [-h] json_file
 Connection values can also come from:
 
 ```bash
+CORTEX_TRAINING_CONNECTION
+SNOWFLAKE_DEFAULT_CONNECTION_NAME
 CORTEX_TRAINING_CONFIG
 CORTEX_TRAINING_BASE_URL
 CORTEX_TRAINING_HOST
@@ -626,7 +654,7 @@ CORTEX_TRAINING_ENDPOINT
 ```
 
 `CORTEX_TRAINING_DISABLE_TELEMETRY` (truthy) skips OTLP client metrics on
-PAT-authenticated clients. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
+Snowflake profile and PAT clients. `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY`
 (truthy) also emits successful outcomes for essential operations; failures
 are emitted by default. See the [Python SDK reference](python-sdk.md#client-metrics).
 
@@ -635,6 +663,11 @@ are emitted by default. See the [Python SDK reference](python-sdk.md#client-metr
 If you see `provide --base-url for local/mock use, or both --host and --pat`,
 the CLI found a `host` but no PAT. Add `"pat": "..."` to `config.json` or set
 `CORTEX_TRAINING_PAT`.
+
+If no legacy config or complete direct connection is present, the CLI falls
+back to the Snowflake Connector's configured default. If your profile is not
+named `default`, pass `--connection NAME` or set
+`SNOWFLAKE_DEFAULT_CONNECTION_NAME`.
 
 If you see `Invalid URL ... No scheme supplied`, the config is using a bare
 Snowflake hostname as `base_url`. Use `host` for Snowflake PAT auth, or use a

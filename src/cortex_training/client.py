@@ -17,7 +17,10 @@
 
 Single-purpose, production-shaped client:
 
-- One auth path: Programmatic Access Token (PAT) — see ``CortexTrainingClient.from_pat``.
+- Snowflake connection profiles — see
+  ``CortexTrainingClient.from_connection_name``.
+- Direct Programmatic Access Token (PAT) compatibility — see
+  ``CortexTrainingClient.from_pat``.
 - One CreateJob shape: a list of typed :class:`SubJobConfig` (each carries either
   a :class:`TrainingConfig` or an :class:`InferenceConfig`). The client-side
   validators mirror the server's own required-field checks so an invalid job
@@ -46,6 +49,7 @@ import shutil
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -64,6 +68,8 @@ from tenacity import wait_exponential_jitter
 from urllib3.exceptions import NewConnectionError
 
 from cortex_training import wire
+from cortex_training.snowflake_auth import SnowflakeProfileAuth
+from cortex_training.snowflake_auth import SnowflakeTelemetryTokenProvider
 from cortex_training.telemetry import CachedSessionTokenProvider
 from cortex_training.telemetry import OtlpMetricEmitter
 
@@ -124,6 +130,7 @@ def _success_telemetry_enabled() -> bool:
 # `max_retries`, with backoff) before the error surfaces. Every other 4xx is
 # excluded because it signals a client/config error that won't fix itself.
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
+_SESSION_EXPIRED_CODES = frozenset({"390111", "390112", "390114"})
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {
     _CHUNK_GROUP_RESTART_REQUIRED,
@@ -186,6 +193,25 @@ def _iter_error_dicts(value: Any, *, depth: int = 0) -> Iterator[dict]:
         except (TypeError, ValueError):
             continue
         yield from _iter_error_dicts(decoded, depth=depth + 1)
+
+
+def _is_session_auth_expired_response(response: requests.Response) -> bool:
+    """Return whether the API explicitly rejected an expired session token."""
+    structured_code_seen = False
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    for candidate in _iter_error_dicts(body):
+        code = candidate.get("code") or candidate.get("error_code")
+        if code is None:
+            continue
+        structured_code_seen = True
+        if str(code) in _SESSION_EXPIRED_CODES:
+            return True
+    # A bare 401 is an authentication rejection, but a structured non-expiry
+    # code must not be turned into a reconnect loop.
+    return response.status_code == 401 and not structured_code_seen
 
 
 def _chunk_group_error_detail(response: requests.Response | None) -> dict | None:
@@ -1020,7 +1046,11 @@ def _validate_artifact_relative_path(path: str) -> str:
 class CortexTrainingClient:
     """HTTP client for the Cortex Training REST API (``cortex-training``).
 
-    Construct with :meth:`from_pat`::
+    Construct with a named Snowflake connection profile::
+
+        client = CortexTrainingClient.from_connection_name("training")
+
+    Direct PAT authentication remains available through :meth:`from_pat`::
 
         client = CortexTrainingClient.from_pat(
             host="ACCOUNT.snowflakecomputing.com",
@@ -1095,6 +1125,8 @@ class CortexTrainingClient:
         # transient get_job failure), so a later call will retry.
         self._sampling_max_seq_len: dict[str, int | None] = {}
         self._artifact_connection_config: dict[str, str] | None = None
+        self._artifact_connection_factory: Callable[[], Any] | None = None
+        self._auth_provider: SnowflakeProfileAuth | None = None
         self._metric_emitter: OtlpMetricEmitter | None = None
         self._operation_metric_state = threading.local()
         self._session = requests.Session()
@@ -1147,6 +1179,56 @@ class CortexTrainingClient:
             )
         return client
 
+    @classmethod
+    def from_connection_name(
+        cls,
+        connection_name: str | None = None,
+        *,
+        database: str | None = None,
+        schema: str | None = None,
+        endpoint: str = "cortex-training",
+        verify_ssl: bool = True,
+        telemetry_timeout: float = 3.0,
+        **kwargs: Any,
+    ) -> "CortexTrainingClient":
+        """Authenticate through a named or configured-default Snowflake profile.
+
+        Profile discovery and authentication are delegated to
+        ``snowflake-connector-python``. The live Connector session token is sent
+        to the Cortex Training API, and the Connector session is recreated once
+        if the API reports token expiry.
+        """
+        auth = SnowflakeProfileAuth(connection_name)
+        resolved_database = database or auth.database
+        if not resolved_database:
+            auth.close()
+            raise ValueError(
+                "Snowflake connection profile must set database, or pass --database"
+            )
+        resolved_schema = schema or auth.schema or "PUBLIC"
+        try:
+            client = cls(
+                base_url=auth.base_url,
+                database=resolved_database,
+                schema=resolved_schema,
+                endpoint=endpoint,
+                **kwargs,
+            )
+        except Exception:
+            auth.close()
+            raise
+        client._auth_provider = auth
+        client._artifact_connection_factory = auth.open_artifact_connection
+        client._session.verify = verify_ssl
+        if not _telemetry_disabled():
+            client._metric_emitter = OtlpMetricEmitter(
+                client.base_url,
+                SnowflakeTelemetryTokenProvider(auth),
+                verify_ssl=verify_ssl,
+                timeout=telemetry_timeout,
+            )
+        return client
+
     @property
     def _prefix(self) -> str:
         return f"{self.base_url}/api/v2/databases/{self.database}/schemas/{self.schema}/{self.endpoint}"
@@ -1160,8 +1242,9 @@ class CortexTrainingClient:
     ) -> None:
         """Emit a best-effort OTLP log record used as a client metric.
 
-        PAT clients lazily exchange the PAT for a cached session token on the
-        first call. Local/mock clients, or clients constructed with
+        Profile clients reuse their live Snowflake session token. PAT clients
+        lazily exchange the PAT for a cached session token on the first call.
+        Local/mock clients, or clients constructed with
         ``CORTEX_TRAINING_DISABLE_TELEMETRY`` set, treat this method as a no-op.
         All authentication, discovery, and export errors are ignored.
         """
@@ -1179,7 +1262,11 @@ class CortexTrainingClient:
         except Exception:
             logger.debug("client telemetry close failed", exc_info=True)
         finally:
-            self._session.close()
+            try:
+                self._session.close()
+            finally:
+                if self._auth_provider is not None:
+                    self._auth_provider.close()
 
     def __enter__(self) -> "CortexTrainingClient":
         return self
@@ -1260,7 +1347,11 @@ class CortexTrainingClient:
         debug_context = kwargs.pop("debug_context", None)
         debug_label = self._debug_context_label(debug_context) if debug_context is not None else None
         attempt_no = 0
+        auth_retry_used = False
         max_attempts = 1 + self.max_retries
+        displayed_max_attempts = max_attempts + (
+            1 if self._auth_provider is not None else 0
+        )
         try:
             state = self._operation_metric_state
             if getattr(state, "active", set()):
@@ -1269,75 +1360,105 @@ class CortexTrainingClient:
             logger.debug("client operation request counting failed", exc_info=True)
 
         def attempt() -> requests.Response:
-            nonlocal attempt_no
-            attempt_no += 1
-            try:
-                state = self._operation_metric_state
-                if getattr(state, "active", set()):
-                    state.attempt_count = getattr(state, "attempt_count", 0) + 1
-            except Exception:
-                logger.debug("client operation attempt counting failed", exc_info=True)
-            if debug_label is not None:
-                logger.debug(
-                    "%s sending %s %s attempt=%d/%d",
-                    debug_label,
-                    method.upper(),
-                    url,
-                    attempt_no,
-                    max_attempts,
-                )
-            try:
-                resp = fn(url, **kwargs)
-            except Exception as exc:
+            nonlocal attempt_no, auth_retry_used
+            while True:
+                attempt_no += 1
+                try:
+                    state = self._operation_metric_state
+                    if getattr(state, "active", set()):
+                        state.attempt_count = getattr(state, "attempt_count", 0) + 1
+                except Exception:
+                    logger.debug(
+                        "client operation attempt counting failed", exc_info=True
+                    )
                 if debug_label is not None:
                     logger.debug(
-                        "%s request exception %s %s attempt=%d/%d: %s: %s",
+                        "%s sending %s %s attempt=%d/%d",
                         debug_label,
                         method.upper(),
                         url,
                         attempt_no,
-                        max_attempts,
-                        type(exc).__name__,
-                        exc,
+                        displayed_max_attempts,
                     )
-                raise
-            status_code = getattr(resp, "status_code", None)
-            headers = getattr(resp, "headers", {}) or {}
-            sf_request_id = headers.get("x-snowflake-request-id")
-            if not isinstance(sf_request_id, str) or not sf_request_id:
-                sf_request_id = None
-            if sf_request_id:
-                req = getattr(resp, "request", None)
-                logger.debug(
-                    "snowflake request_id=%s  %s %s  status=%d",
-                    sf_request_id,
-                    getattr(req, "method", method.upper()),
-                    getattr(req, "path_url", url),
-                    status_code,
-                )
-            if debug_label is not None:
+
+                request_kwargs = kwargs
+                observed_token: str | None = None
+                if self._auth_provider is not None:
+                    observed_token = self._auth_provider.get_token()
+                    request_headers = dict(kwargs.get("headers") or {})
+                    request_headers["Authorization"] = (
+                        f'Snowflake Token="{observed_token}"'
+                    )
+                    request_kwargs = {**kwargs, "headers": request_headers}
                 try:
-                    status_int = int(status_code)
-                except (TypeError, ValueError):
-                    status_int = None
-                outcome = (
-                    "successful response" if status_int is not None and 200 <= status_int < 400 else "failed response"
-                )
-                snowflake = f" snowflake_request_id={sf_request_id}" if sf_request_id else ""
-                logger.debug(
-                    "%s %s %s %s attempt=%d/%d status=%s%s body=%s",
-                    debug_label,
-                    outcome,
-                    method.upper(),
-                    url,
-                    attempt_no,
-                    max_attempts,
-                    status_code,
-                    snowflake,
-                    self._debug_response_summary(resp),
-                )
-            resp.raise_for_status()
-            return resp
+                    resp = fn(url, **request_kwargs)
+                except Exception as exc:
+                    if debug_label is not None:
+                        logger.debug(
+                            "%s request exception %s %s attempt=%d/%d: %s: %s",
+                            debug_label,
+                            method.upper(),
+                            url,
+                            attempt_no,
+                            displayed_max_attempts,
+                            type(exc).__name__,
+                            exc,
+                        )
+                    raise
+
+                if (
+                    self._auth_provider is not None
+                    and not auth_retry_used
+                    and _is_session_auth_expired_response(resp)
+                ):
+                    auth_retry_used = True
+                    resp.close()
+                    self._auth_provider.refresh(observed_token)
+                    continue
+
+                status_code = getattr(resp, "status_code", None)
+                headers = getattr(resp, "headers", {}) or {}
+                sf_request_id = headers.get("x-snowflake-request-id")
+                if not isinstance(sf_request_id, str) or not sf_request_id:
+                    sf_request_id = None
+                if sf_request_id:
+                    req = getattr(resp, "request", None)
+                    logger.debug(
+                        "snowflake request_id=%s  %s %s  status=%d",
+                        sf_request_id,
+                        getattr(req, "method", method.upper()),
+                        getattr(req, "path_url", url),
+                        status_code,
+                    )
+                if debug_label is not None:
+                    try:
+                        status_int = int(status_code)
+                    except (TypeError, ValueError):
+                        status_int = None
+                    outcome = (
+                        "successful response"
+                        if status_int is not None and 200 <= status_int < 400
+                        else "failed response"
+                    )
+                    snowflake = (
+                        f" snowflake_request_id={sf_request_id}"
+                        if sf_request_id
+                        else ""
+                    )
+                    logger.debug(
+                        "%s %s %s %s attempt=%d/%d status=%s%s body=%s",
+                        debug_label,
+                        outcome,
+                        method.upper(),
+                        url,
+                        attempt_no,
+                        displayed_max_attempts,
+                        status_code,
+                        snowflake,
+                        self._debug_response_summary(resp),
+                    )
+                resp.raise_for_status()
+                return resp
 
         retryer = Retrying(
             retry=retry_if_exception(retry_on),
@@ -1622,6 +1743,12 @@ class CortexTrainingClient:
 
     def _open_experiment_artifact_connection(self) -> Any:
         """Open a connector session for Snowflake experiment artifact LIST/GET."""
+        if self._artifact_connection_factory is not None:
+            return self._artifact_connection_factory()
+        if self._artifact_connection_config is None:
+            raise RuntimeError(
+                "experiment artifact download requires a Snowflake-authenticated client"
+            )
         import snowflake.connector
 
         return snowflake.connector.connect(**self._snowflake_connection_kwargs())

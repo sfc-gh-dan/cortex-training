@@ -23,13 +23,12 @@ Cortex Training is Snowflake's serverless platform for post-training open-weight
    ```
    Alternatively, `uv pip install cortex-training` installs the SDK and CLI
    without recipes.
-2. **Get access** — you need a Snowflake account with Cortex Training enabled
-   and a [programmatic access token](docs/getting-started/setup.md#2-create-a-programmatic-access-token-pat).
-3. **Log in** — [create a connection config](docs/getting-started/setup.md#3-create-a-connection-config-and-log-in),
-   then:
+2. **Get access** — you need a Snowflake account with Cortex Training enabled.
+3. **Connect** — configure a standard
+   [Snowflake connection profile](docs/getting-started/setup.md), then:
    ```bash
-   cortex-training login ~/your-config.json
-   cortex-training capacity   # check available GPU capacity
+   cortex-training --connection training capacity
+   # With a configured default profile: cortex-training capacity
    ```
 
 ## Quick Example

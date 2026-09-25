@@ -8,7 +8,18 @@ from cortex_training import CortexTrainingClient, SubJobConfig, JobType
 client: every data-plane call returns a `request_id` that you poll, and results
 are whatever the backend returns.
 
-Construct it with a Programmatic Access Token:
+Construct it with a named Snowflake connection profile:
+
+```python
+client = CortexTrainingClient.from_connection_name("training")
+```
+
+Pass no name to use the Connector-configured default profile. The profile's
+database and schema are used unless explicitly overridden. The client shares
+the profile's live Snowflake session token with REST and telemetry calls,
+reconnecting once when the API reports token expiry.
+
+Direct Programmatic Access Token construction remains supported:
 
 ```python
 client = CortexTrainingClient.from_pat(
@@ -21,13 +32,13 @@ client = CortexTrainingClient.from_pat(
 
 Tuning knobs on the constructor: `endpoint`, `poll_interval` (0.5s),
 `poll_timeout` (1800s), `poll_backoff_multiplier` (1.25), `poll_max_interval`
-(6s), `pool_maxsize` (1024), `max_retries` (10). `from_pat` also accepts
-`telemetry_timeout` (3s) for best-effort client metrics.
+(6s), `pool_maxsize` (1024), `max_retries` (10). `from_connection_name` and
+`from_pat` also accept `telemetry_timeout` (3s) for best-effort client metrics.
 
 ## Client metrics
 
-Clients created with `CortexTrainingClient.from_pat` automatically emit one
-best-effort event when an essential operation fails. Set
+Snowflake profile and PAT clients automatically emit one best-effort event
+when an essential operation fails. Set
 `CORTEX_TRAINING_ENABLE_SUCCESS_TELEMETRY=1` to also emit successful outcomes.
 Local or mock clients constructed with an explicit `base_url` treat
 `emit_metric` as a no-op. Set `CORTEX_TRAINING_DISABLE_TELEMETRY=1` to skip

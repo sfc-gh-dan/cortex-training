@@ -15,12 +15,9 @@
 
 """Resolve Cortex Training connection arguments and launch the read-only TUI.
 
-Connection handling is delegated to ``cortex_training._cli`` so the TUI shares the
-SDK's auth surface: it honours ``cortex-training login`` state, ``--config`` /
-``CORTEX_TRAINING_CONFIG``, the ``CORTEX_TRAINING_*`` / ``SNOWFLAKE_*`` env vars, and explicit
-``--base-url`` (local/mock) or ``--host`` + ``--pat`` flags, exactly like the
-CLI. Run ``cortex-training login config.json`` once and then just
-``cortex-training tui JOB_ID``.
+Connection handling is delegated to ``cortex_training._cli`` so the TUI shares
+the SDK's auth surface: legacy config/login state wins, followed by direct
+flags, then a named or configured-default Snowflake connection profile.
 """
 
 from __future__ import annotations
@@ -47,6 +44,12 @@ def _build_arg_parser(*, prog: str = "cortex-training tui") -> argparse.Argument
             "Path to a reusable Cortex Training config or credential JSON file "
             "(same format as the cortex-training CLI config)."
         ),
+    )
+    p.add_argument(
+        "--connection",
+        "-c",
+        default=os.environ.get("CORTEX_TRAINING_CONNECTION"),
+        help="Snowflake connection profile name.",
     )
     p.add_argument("--base-url", help="Direct base URL for a local or otherwise compatible server.")
     p.add_argument("--host", help="Snowflake account host for PAT auth.")
@@ -88,13 +91,17 @@ def run(argv=None, *, prog: str = "cortex-training tui") -> int:
         args = cli._normalize_connection_args(args)
     except ValueError as exc:
         parser.error(str(exc))
-    if not args.database:
+    if not args.use_connection_profile and not args.database:
         parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
-    if args.base_url is None and (args.host is None or args.pat is None):
+    if (
+        not args.use_connection_profile
+        and args.base_url is None
+        and (args.host is None or args.pat is None)
+    ):
         parser.error(
             "no connection configured: run 'cortex-training login config.json', "
-            "set CORTEX_TRAINING_CONFIG, pass --config config.json, or pass "
-            "--base-url (local/mock) or --host + --pat"
+            "set CORTEX_TRAINING_CONFIG, pass --config config.json, "
+            "--connection NAME, --base-url (local/mock), or --host + --pat"
         )
 
     client = cli.build_client(args, cli._load_cortex_training_client_class())
