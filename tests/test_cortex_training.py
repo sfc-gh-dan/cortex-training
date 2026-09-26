@@ -217,3 +217,22 @@ def test_tui_delegates_without_resolving_connection(monkeypatch):
         "argv": ["--config", "config.json", "job-1", "--sub-job-id", "sub-1"],
         "prog": "cortex-training tui",
     }
+
+
+def test_tui_delegates_named_connection(monkeypatch):
+    captured = {}
+
+    def run_tui(argv, *, prog):
+        captured["argv"] = argv
+        captured["prog"] = prog
+        return 17
+
+    monkeypatch.setattr(cortex_cli, "_run_tui", run_tui)
+
+    result = cortex_cli.main(["-c", "training", "tui", "job-1"])
+
+    assert result == 17
+    assert captured == {
+        "argv": ["-c", "training", "job-1"],
+        "prog": "cortex-training tui",
+    }

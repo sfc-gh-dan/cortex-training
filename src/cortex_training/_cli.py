@@ -143,6 +143,15 @@ def build_parser(
         help="Path to a reusable Cortex Training CLI config JSON file.",
     )
     parser.add_argument(
+        "--connection",
+        "-c",
+        default=_env("CORTEX_TRAINING_CONNECTION"),
+        help=(
+            "Snowflake connection profile name. When no legacy config or direct "
+            "credentials are configured, the Snowflake default profile is used."
+        ),
+    )
+    parser.add_argument(
         "--base-url",
         help="Base URL for a local or otherwise compatible server. Skips PAT auth.",
     )
@@ -169,7 +178,7 @@ def build_parser(
     parser.add_argument(
         "--no-verify-ssl",
         action="store_true",
-        help="Disable SSL certificate verification for PAT-authenticated requests.",
+        help="Disable SSL certificate verification for authenticated requests.",
     )
     parser.add_argument("--poll-interval", type=float)
     parser.add_argument("--poll-timeout", type=float)
@@ -509,7 +518,12 @@ def _has_connection(
 
 
 def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, Any]:
+    args._legacy_config_selected = False
+    if getattr(args, "connection", None):
+        return {}
+
     if args.config:
+        args._legacy_config_selected = True
         return _load_config(args.config)
 
     if not load_login:
@@ -528,7 +542,10 @@ def _select_config(args: argparse.Namespace, *, load_login: bool) -> dict[str, A
     login_config = _read_login_config_path()
     if login_config is None:
         return {}
+    if not Path(login_config).expanduser().is_file():
+        return {}
     args.config = login_config
+    args._legacy_config_selected = True
     return _load_config(login_config)
 
 
@@ -538,20 +555,25 @@ def _resolve_args(
     load_login: bool = True,
 ) -> argparse.Namespace:
     config = _select_config(args, load_login=load_login)
+    profile_requested = bool(getattr(args, "connection", None))
     args.base_url = _coalesce(
         args.base_url,
         _config_str(config, "base_url"),
-        _env("CORTEX_TRAINING_BASE_URL"),
+        None if profile_requested else _env("CORTEX_TRAINING_BASE_URL"),
     )
     args.host = _coalesce(
         args.host,
         _config_str(config, "host"),
-        _env("CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST"),
+        None
+        if profile_requested
+        else _env("CORTEX_TRAINING_HOST", "SNOWFLAKE_HOST"),
     )
     args.pat = _coalesce(
         args.pat,
         _config_str(config, "pat"),
-        _env("CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"),
+        None
+        if profile_requested
+        else _env("CORTEX_TRAINING_PAT", "SNOWFLAKE_PAT"),
     )
     args.database = _coalesce(
         args.database,
@@ -562,7 +584,6 @@ def _resolve_args(
         args.schema,
         _config_str(config, "schema"),
         _env("CORTEX_TRAINING_SCHEMA", "SNOWFLAKE_SCHEMA"),
-        "PUBLIC",
     )
     args.endpoint = _coalesce(
         args.endpoint,
@@ -587,6 +608,17 @@ def _resolve_args(
             args.no_verify_ssl = no_verify_ssl
         elif verify_ssl is not None:
             args.no_verify_ssl = not verify_ssl
+    direct_credentials_present = any((args.base_url, args.host, args.pat))
+    if profile_requested and direct_credentials_present:
+        raise ValueError(
+            "--connection cannot be combined with --base-url, --host, or --pat"
+        )
+    direct_connection_complete = bool(args.base_url or (args.host and args.pat))
+    args.use_connection_profile = profile_requested or (
+        not args._legacy_config_selected and not direct_connection_complete
+    )
+    if not args.use_connection_profile and args.schema is None:
+        args.schema = "PUBLIC"
     return args
 
 
@@ -619,6 +651,8 @@ def parse_args(
     if dry_run:
         return args
     args = _normalize_connection_args(args)
+    if args.use_connection_profile:
+        return args
     if not args.database:
         parser.error("provide --database or set CORTEX_TRAINING_DATABASE/SNOWFLAKE_DATABASE")
     if args.base_url is None and (args.host is None or args.pat is None):
@@ -636,6 +670,12 @@ def build_client(args: argparse.Namespace, cortex_training_client_cls):
     }
     if args.base_url:
         return cortex_training_client_cls(base_url=args.base_url, **kwargs)
+    if args.use_connection_profile:
+        return cortex_training_client_cls.from_connection_name(
+            connection_name=args.connection,
+            verify_ssl=not args.no_verify_ssl,
+            **kwargs,
+        )
     return cortex_training_client_cls.from_pat(
         host=_normalize_host(args.host),
         pat=args.pat,

@@ -642,6 +642,103 @@ class TestClientConstruction:
         assert c._metric_emitter.timeout == 1.5
         assert c._metric_emitter.token_provider.timeout == 1.5
 
+    def test_from_connection_name_uses_connector_context(self, monkeypatch):
+        auth = MagicMock()
+        auth.base_url = "https://profile.example:8443"
+        auth.database = "PROFILE_DB"
+        auth.schema = "PROFILE_SCHEMA"
+        auth.open_artifact_connection = MagicMock()
+        auth_type = MagicMock(return_value=auth)
+        monkeypatch.setattr(nc, "SnowflakeProfileAuth", auth_type)
+
+        c = CortexTrainingClient.from_connection_name("training-profile")
+
+        auth_type.assert_called_once_with("training-profile")
+        assert c.base_url == "https://profile.example:8443"
+        assert c.database == "PROFILE_DB"
+        assert c.schema == "PROFILE_SCHEMA"
+        assert c._auth_provider is auth
+        assert c._artifact_connection_factory is auth.open_artifact_connection
+        assert isinstance(
+            c._metric_emitter.token_provider,
+            nc.SnowflakeTelemetryTokenProvider,
+        )
+        assert c._metric_emitter.token_provider._auth is auth
+
+        c.close()
+        auth.close.assert_called_once()
+
+    def test_from_connection_name_allows_routing_overrides(self, monkeypatch):
+        auth = MagicMock()
+        auth.base_url = "https://profile.example"
+        auth.database = "PROFILE_DB"
+        auth.schema = "PROFILE_SCHEMA"
+        monkeypatch.setattr(nc, "SnowflakeProfileAuth", MagicMock(return_value=auth))
+
+        c = CortexTrainingClient.from_connection_name(
+            "training-profile", database="OVERRIDE_DB", schema="OVERRIDE_SCHEMA"
+        )
+
+        assert c.database == "OVERRIDE_DB"
+        assert c.schema == "OVERRIDE_SCHEMA"
+
+    def test_from_connection_name_requires_database(self, monkeypatch):
+        auth = MagicMock()
+        auth.base_url = "https://profile.example"
+        auth.database = None
+        auth.schema = None
+        monkeypatch.setattr(nc, "SnowflakeProfileAuth", MagicMock(return_value=auth))
+
+        with pytest.raises(ValueError, match="must set database"):
+            CortexTrainingClient.from_connection_name("training-profile")
+
+        auth.close.assert_called_once()
+
+    def test_profile_client_sends_live_session_token(self):
+        c = _make_client(get_json={"job_id": "j1"})
+        auth = MagicMock()
+        auth.get_token.return_value = "session-token"
+        c._auth_provider = auth
+
+        assert c.get_job("j1") == {"job_id": "j1"}
+
+        c._session.get.assert_called_once_with(
+            f"{c._prefix}/j1",
+            headers={"Authorization": 'Snowflake Token="session-token"'},
+        )
+
+    def test_profile_client_refreshes_and_replays_once_on_session_expiry(self):
+        c = _make_client()
+        expired = _make_error_response({"code": "390112"}, status_code=401)
+        succeeded = _make_response({"job_id": "j1"})
+        c._session.get.side_effect = [expired, succeeded]
+        auth = MagicMock()
+        auth.get_token.side_effect = ["old-token", "new-token"]
+        c._auth_provider = auth
+
+        assert c.get_job("j1") == {"job_id": "j1"}
+
+        auth.refresh.assert_called_once_with("old-token")
+        assert c._session.get.call_args_list[0].kwargs["headers"] == {
+            "Authorization": 'Snowflake Token="old-token"'
+        }
+        assert c._session.get.call_args_list[1].kwargs["headers"] == {
+            "Authorization": 'Snowflake Token="new-token"'
+        }
+
+    def test_profile_client_does_not_refresh_structured_non_expiry_401(self):
+        c = _make_client()
+        rejected = _make_error_response({"code": "390100"}, status_code=401)
+        c._session.get.return_value = rejected
+        auth = MagicMock()
+        auth.get_token.return_value = "session-token"
+        c._auth_provider = auth
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.get_job("j1")
+
+        auth.refresh.assert_not_called()
+
     def test_emit_metric_is_noop_without_pat(self):
         c = CortexTrainingClient(base_url="http://x.test", database="DB", schema="SCH")
         assert c.emit_metric("event") is None
@@ -659,6 +756,14 @@ class TestClientConstruction:
         c.close()
         c._metric_emitter.close.assert_called_once()
         c._session.close.assert_called_once()
+
+    def test_close_releases_profile_auth(self):
+        c = _make_client()
+        c._auth_provider = MagicMock()
+
+        c.close()
+
+        c._auth_provider.close.assert_called_once()
 
     def test_telemetry_close_error_does_not_skip_http_session_close(self):
         c = _make_client()
@@ -2597,9 +2702,17 @@ class TestExecutionLogDownload:
             with pytest.raises(ValueError, match="unsafe"):
                 nc._validate_artifact_relative_path(path)
 
-    def test_artifact_connection_requires_pat_client(self):
-        with pytest.raises(RuntimeError, match="PAT-authenticated"):
+    def test_artifact_connection_requires_snowflake_client(self):
+        with pytest.raises(RuntimeError, match="Snowflake-authenticated"):
             _make_client()._open_experiment_artifact_connection()
+
+    def test_artifact_connection_uses_profile_factory(self):
+        c = _make_client()
+        connected = object()
+        c._artifact_connection_factory = MagicMock(return_value=connected)
+
+        assert c._open_experiment_artifact_connection() is connected
+        c._artifact_connection_factory.assert_called_once_with()
 
     @pytest.mark.parametrize(
         ("host", "account"),

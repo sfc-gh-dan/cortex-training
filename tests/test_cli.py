@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -1420,3 +1421,161 @@ def test_login_rejects_invalid_config(tmp_path, monkeypatch, config_flags):
     assert rc == 1
     assert not login_state.exists()
     assert "unknown config key" in stderr.getvalue()
+
+
+def test_no_legacy_config_falls_back_to_default_snowflake_profile(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing-login.json")
+    )
+    for name in (
+        "CORTEX_TRAINING_CONFIG",
+        "CORTEX_TRAINING_BASE_URL",
+        "CORTEX_TRAINING_HOST",
+        "SNOWFLAKE_HOST",
+        "CORTEX_TRAINING_PAT",
+        "SNOWFLAKE_PAT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+    assert seen["connection"] is None
+    assert seen["database"] is None
+    assert seen["schema"] is None
+
+
+@pytest.mark.parametrize(
+    ("environment_name", "environment_value"),
+    [
+        ("SNOWFLAKE_HOST", "leftover.example"),
+        ("SNOWFLAKE_PAT", "leftover-pat"),
+    ],
+)
+def test_incomplete_direct_environment_falls_back_to_default_profile(
+    tmp_path, monkeypatch, environment_name, environment_value
+):
+    monkeypatch.setenv(
+        "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing-login.json")
+    )
+    for name in (
+        "CORTEX_TRAINING_CONFIG",
+        "CORTEX_TRAINING_BASE_URL",
+        "CORTEX_TRAINING_HOST",
+        "SNOWFLAKE_HOST",
+        "CORTEX_TRAINING_PAT",
+        "SNOWFLAKE_PAT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(environment_name, environment_value)
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+    assert seen["connection"] is None
+
+
+def test_named_connection_bypasses_invalid_login_state(tmp_path, monkeypatch):
+    login_state = tmp_path / "login.json"
+    login_state.write_text("not json", encoding="utf-8")
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(
+        ["--connection", "training-profile", "list"],
+        client_factory=make_client,
+        stdout=io.StringIO(),
+    )
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+    assert seen["connection"] == "training-profile"
+
+
+def test_existing_legacy_config_wins_over_profile_fallback(tmp_path, monkeypatch):
+    config = _write_config(
+        tmp_path,
+        {"base_url": "http://legacy.local", "database": "LEGACY_DB"},
+    )
+    monkeypatch.setenv("CORTEX_TRAINING_CONFIG", str(config))
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is False
+    assert seen["base_url"] == "http://legacy.local"
+
+
+def test_missing_remembered_config_falls_back_to_profile(tmp_path, monkeypatch):
+    login_state = tmp_path / "login.json"
+    login_state.write_text(
+        json.dumps({"config_path": str(tmp_path / "removed-config.json")}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CORTEX_TRAINING_LOGIN_FILE", str(login_state))
+    seen = {}
+
+    def make_client(args):
+        seen.update(vars(args))
+        return FakeClient()
+
+    rc = cli.main(["list"], client_factory=make_client, stdout=io.StringIO())
+
+    assert rc == 0
+    assert seen["use_connection_profile"] is True
+
+
+def test_named_connection_conflicts_with_direct_flags():
+    stderr = io.StringIO()
+
+    rc = cli.main(
+        ["--connection", "training-profile", "--host", "x.test", "list"],
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "--connection cannot be combined" in stderr.getvalue()
+
+
+def test_build_client_uses_named_snowflake_connection(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "CORTEX_TRAINING_LOGIN_FILE", str(tmp_path / "missing.json")
+    )
+    args = cli.parse_args(["--connection", "training-profile", "list"])
+    client_cls = MagicMock()
+    connected = object()
+    client_cls.from_connection_name.return_value = connected
+
+    assert cli.build_client(args, client_cls) is connected
+    client_cls.from_connection_name.assert_called_once_with(
+        connection_name="training-profile",
+        database=None,
+        schema=None,
+        endpoint="cortex-training",
+        poll_interval=0.5,
+        poll_timeout=1800.0,
+        verify_ssl=True,
+    )
