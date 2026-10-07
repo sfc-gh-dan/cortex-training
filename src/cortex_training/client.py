@@ -361,15 +361,21 @@ def _snowflake_request_attributes(
     error: BaseException | None,
     request_ids: list[str],
 ) -> dict[str, Any]:
-    """Snowflake request ids for an outcome: the failing response's, else the last seen."""
+    """Snowflake request ids for an operation outcome.
+
+    ``snowflake.request_id`` is only ever the failing response's own id. When
+    the outcome has no response of its own (success, a poll that ended
+    ``failed``, a timeout, a connection error), ``snowflake.last_request_id``
+    names the operation's most recent request instead, so it is never read as
+    the request that failed.
+    """
     attributes: dict[str, Any] = {}
-    request_id = None
-    if error is not None:
-        request_id = _response_snowflake_request_id(getattr(error, "response", None))
-    if request_id is None and request_ids:
-        request_id = request_ids[-1]
+    response = getattr(error, "response", None) if error is not None else None
+    request_id = _response_snowflake_request_id(response)
     if request_id is not None:
         attributes["snowflake.request_id"] = request_id
+    elif response is None and request_ids:
+        attributes["snowflake.last_request_id"] = request_ids[-1]
     if request_ids:
         attributes["snowflake.request_ids"] = list(request_ids)
     return attributes
@@ -382,14 +388,25 @@ def _log_operation_failure(
 ) -> None:
     """Surface the Snowflake request id of a failed operation when the error lacks it."""
     try:
-        request_id = _snowflake_request_attributes(exc, request_ids).get(
-            "snowflake.request_id"
-        )
-        if request_id is None or request_id in str(exc):
+        response = getattr(exc, "response", None)
+        request_id = _response_snowflake_request_id(response)
+        label = "snowflake request id"
+        if request_id is None:
+            if response is not None or not request_ids:
+                return
+            if isinstance(exc, (ValueError, TypeError)) and not isinstance(
+                exc, requests.exceptions.RequestException
+            ):
+                # Client-side validation; an earlier request did not fail.
+                return
+            request_id = request_ids[-1]
+            label = "last snowflake request id"
+        if request_id in str(exc):
             return
         logger.warning(
-            "%s failed (snowflake request id: %s): %s",
+            "%s failed (%s: %s): %s",
             operation,
+            label,
             request_id,
             _safe_metric_error_message(exc),
         )
@@ -480,6 +497,12 @@ def _track_operation(operation: str):
             try:
                 result = method(self, *args, **kwargs)
             except Exception as exc:
+                # Errors wrapped after _send (e.g. chunk-group errors) are
+                # still HTTPErrors carrying the failing response.
+                if isinstance(exc, requests.exceptions.HTTPError):
+                    _add_snowflake_request_id_to_error(
+                        exc, _response_snowflake_request_id(exc.response)
+                    )
                 _log_operation_failure(operation, exc, state.snowflake_request_ids)
                 if arguments is not None:
                     self._emit_operation_outcome(
@@ -1664,9 +1687,7 @@ class CortexTrainingClient:
                     try:
                         state = self._operation_metric_state
                         if getattr(state, "active", set()):
-                            seen = getattr(state, "snowflake_request_ids", None)
-                            if seen is None:
-                                seen = state.snowflake_request_ids = []
+                            seen = state.snowflake_request_ids
                             seen.append(sf_request_id)
                             del seen[:-_MAX_TRACKED_SNOWFLAKE_REQUEST_IDS]
                     except Exception:
