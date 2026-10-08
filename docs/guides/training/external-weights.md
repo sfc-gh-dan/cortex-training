@@ -47,15 +47,23 @@ a named internal stage and upload the directory with `PUT`.
 
 ### Before you start
 
-- A working connection profile. Use the same profile you configured for the
-  client in [Set Up the Client](../../getting-started/setup.md); confirm it with
-  `cortex-training --connection NAME capacity`.
+- A working client connection, either a connection profile or a JSON config
+  file, as configured in [Set Up the Client](../../getting-started/setup.md).
+  Confirm it with `cortex-training --connection NAME capacity` (profile) or
+  `cortex-training --config PATH capacity` (JSON config).
 - A role with `USAGE` on the database and schema and `CREATE STAGE` on the
   schema. The role that creates the stage owns it and can upload to it.
 - The role that submits the training job must be able to read the stage. If it
   is a different role, grant it access:
   `GRANT READ ON STAGE MY_DB.MY_SCHEMA.MODEL_IMPORT TO ROLE TRAINING_ROLE;`
 - No warehouse is needed: `CREATE STAGE`, `PUT`, and `LIST` do not use compute.
+- A new stage, or one created with `ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')`.
+  `CREATE STAGE IF NOT EXISTS` leaves an existing stage as it is, including its
+  encryption, so the upload succeeds but the job cannot read it, and an internal
+  stage's encryption cannot be changed later. To check an existing stage, run
+  `SHOW STAGES LIKE 'MODEL_IMPORT' IN SCHEMA MY_DB.MY_SCHEMA;` and confirm the
+  `type` column reads `INTERNAL NO CSE`. If it reads `INTERNAL`, use a new stage
+  name.
 
 ### Where to run the SQL
 
@@ -64,9 +72,9 @@ your machine, so it must run from a Snowflake client on the machine that holds
 the model directory; it is not available in a Snowsight worksheet.
 
 The simplest option is the Snowflake Python connector, which is already
-installed with the Cortex Training client and reads the same connection
-profile. Save this as `upload_weights.py`, adjust the names, and run
-`python upload_weights.py`:
+installed with the Cortex Training client. Save this as `upload_weights.py`,
+adjust the names, and run `python upload_weights.py`. It reads the same
+connection profile the client uses:
 
 ```python
 import snowflake.connector
@@ -87,10 +95,29 @@ with snowflake.connector.connect(connection_name=PROFILE) as conn:
         print(row[0], row[1])
 ```
 
+If you configured the client with a JSON config file instead of a profile,
+replace the `connect(...)` line with the following. The connector also needs
+your Snowflake user name, which the JSON config does not hold; use the user
+that owns the token.
+
+```python
+import json
+
+cfg = json.load(open("/path/to/config.json"))
+connection = snowflake.connector.connect(
+    host=cfg["host"],
+    account=cfg["host"],                  # the connector derives the account from the host
+    user="YOUR_USER",
+    authenticator="PROGRAMMATIC_ACCESS_TOKEN",
+    token=cfg["pat"],
+)
+with connection as conn:
+    ...                                   # same statements as above
+```
+
 `LIST` should show `config.json`, the safetensors files, and the tokenizer
 files directly under the target path, at their original sizes, with no `.gz`
-suffix. Uploading a 1.5 GB model takes well under a minute on a typical
-connection.
+suffix.
 
 If you already use [Snowflake CLI](https://docs.snowflake.com/en/developer-guide/snowflake-cli/index),
 you can run the same statements from a file instead:
@@ -151,7 +178,16 @@ cortex-training submit examples/api/external-weights-training.json --wait
 The Python SDK uses the same request field:
 
 ```python
-from cortex_training.client import SubJobConfig
+from cortex_training.client import CortexTrainingClient, SubJobConfig
+
+client = CortexTrainingClient.from_connection_name("training")
+# With a JSON config file instead of a profile:
+# client = CortexTrainingClient.from_pat(
+#     host="ACCOUNT.snowflakecomputing.com",
+#     pat=PAT,
+#     database="CORTEX_TRAINING_DB",
+#     schema="PUBLIC",
+# )
 
 training = SubJobConfig.training_job(
     model_name="Qwen/Qwen3-0.6B",
