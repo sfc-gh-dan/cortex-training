@@ -42,18 +42,64 @@ tokenizer.save_pretrained("/absolute/path/to/model")
 
 ## Upload the weights to a stage
 
-The source must be a readable, S3-backed Snowflake stage. For a named internal
-stage, use Snowflake server-side encryption so the service can read it:
+The source must be a readable, S3-backed Snowflake stage. The steps below create
+a named internal stage and upload the directory with `PUT`.
 
-```sql
-CREATE STAGE MY_DB.MY_SCHEMA.MODEL_IMPORT
-  ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+### Before you start
+
+- A working connection profile. Use the same profile you configured for the
+  client in [Set Up the Client](../../getting-started/setup.md); confirm it with
+  `cortex-training --connection NAME capacity`.
+- A role with `USAGE` on the database and schema and `CREATE STAGE` on the
+  schema. The role that creates the stage owns it and can upload to it.
+- The role that submits the training job must be able to read the stage. If it
+  is a different role, grant it access:
+  `GRANT READ ON STAGE MY_DB.MY_SCHEMA.MODEL_IMPORT TO ROLE TRAINING_ROLE;`
+- No warehouse is needed: `CREATE STAGE`, `PUT`, and `LIST` do not use compute.
+
+### Where to run the SQL
+
+These are Snowflake SQL statements, not shell commands. `PUT` reads files from
+your machine, so it must run from a Snowflake client on the machine that holds
+the model directory; it is not available in a Snowsight worksheet.
+
+The simplest option is the Snowflake Python connector, which is already
+installed with the Cortex Training client and reads the same connection
+profile. Save this as `upload_weights.py`, adjust the names, and run
+`python upload_weights.py`:
+
+```python
+import snowflake.connector
+
+PROFILE = "training"                      # your connections.toml profile
+STAGE = "MY_DB.MY_SCHEMA.MODEL_IMPORT"
+MODEL_DIR = "/absolute/path/to/model"      # directory holding config.json
+TARGET = f"@{STAGE}/qwen-sft-run7"
+
+with snowflake.connector.connect(connection_name=PROFILE) as conn:
+    cur = conn.cursor()
+    # SNOWFLAKE_SSE lets the service read the stage; the default encryption
+    # for a named internal stage does not.
+    cur.execute(f"CREATE STAGE IF NOT EXISTS {STAGE} ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')")
+    # PUT compresses by default, which would turn safetensors into .gz files.
+    cur.execute(f"PUT file://{MODEL_DIR}/* {TARGET} AUTO_COMPRESS = FALSE OVERWRITE = TRUE")
+    for row in cur.execute(f"LIST {TARGET}"):
+        print(row[0], row[1])
 ```
 
-Upload every file without compression. `PUT` compresses files by default, which
-would turn safetensors into unsupported `.gz` objects.
+`LIST` should show `config.json`, the safetensors files, and the tokenizer
+files directly under the target path, at their original sizes, with no `.gz`
+suffix. Uploading a 1.5 GB model takes well under a minute on a typical
+connection.
+
+If you already use [Snowflake CLI](https://docs.snowflake.com/en/developer-guide/snowflake-cli/index),
+you can run the same statements from a file instead:
+`snow sql -c training -f upload.sql`, where `upload.sql` contains:
 
 ```sql
+CREATE STAGE IF NOT EXISTS MY_DB.MY_SCHEMA.MODEL_IMPORT
+  ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+
 PUT file:///absolute/path/to/model/*
   @MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7
   AUTO_COMPRESS = FALSE
@@ -62,14 +108,11 @@ PUT file:///absolute/path/to/model/*
 LIST @MY_DB.MY_SCHEMA.MODEL_IMPORT/qwen-sft-run7;
 ```
 
-`PUT` runs from a client such as SnowSQL, Snowflake CLI, or the Snowflake
-Python connector; it is not available in a Snowsight worksheet. It uploads only
-to internal stages. For an external S3 stage, upload the uncompressed files
-with your object-storage tooling or copy them from an internal stage while
-preserving the same flat layout.
+`PUT` uploads only to internal stages. For an external S3 stage, upload the
+uncompressed files with your object-storage tooling, keeping the same flat
+layout, and grant the submitting role `USAGE` on the stage.
 
-The role that submits the job must be able to read the stage. Keep the objects
-unchanged while the job is initializing.
+Keep the objects unchanged while the job is initializing.
 
 ## Create the job
 
