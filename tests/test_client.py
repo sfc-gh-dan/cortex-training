@@ -901,7 +901,7 @@ class TestOperationMetrics:
 
         with pytest.raises(
             nc.requests.exceptions.HTTPError,
-            match=r"\(snowflake request id: sf-request-1\)",
+            match=r"^\[snowflake request id: sf-request-1\] ",
         ):
             c.step("job-1")
 
@@ -916,6 +916,7 @@ class TestOperationMetrics:
             "job_id": "job-1",
             "error.type": "HTTPError",
             "error.http_status": 400,
+            "error.snowflake_request_id": "sf-request-1",
             "snowflake.request_id": "sf-request-1",
             "snowflake.request_ids": ["sf-request-1"],
             "error.code": "CORTEX_TRAINING_BAD_REQUEST",
@@ -931,16 +932,16 @@ class TestOperationMetrics:
         with caplog.at_level("WARNING", logger=nc.logger.name):
             with pytest.raises(
                 nc.requests.exceptions.HTTPError,
-                match=r"^400 Client Error.*\(snowflake request id: sf-request-1\)$",
+                match=r"^\[snowflake request id: sf-request-1\] 400 Client Error",
             ):
                 c.step("job-1")
 
         # The id is already in the raised error, so no duplicate warning.
-        assert not [r for r in caplog.records if "failed (snowflake" in r.message]
+        assert not [r for r in caplog.records if "last snowflake request id" in r.message]
         assert c._operation_metric_state.active == set()
         assert c._operation_metric_state.snowflake_request_ids == []
 
-    def test_non_http_failure_logs_and_records_last_request_id(
+    def test_non_http_failure_logs_last_request_id_from_history(
         self, monkeypatch, caplog
     ):
         c = _make_client()
@@ -958,7 +959,7 @@ class TestOperationMetrics:
                 c.poll_request("job-1", "r1")
 
         assert any(
-            "poll_request failed (last snowflake request id: sf-poll-2)" in r.getMessage()
+            "[last snowflake request id: sf-poll-2] poll_request failed" in r.getMessage()
             for r in caplog.records
         )
         operation, value = c._metric_emitter.emit.call_args.args
@@ -966,8 +967,7 @@ class TestOperationMetrics:
         assert operation == "poll_request"
         assert value["success"] is False
         assert attributes["error.type"] == "RuntimeError"
-        assert "snowflake.request_id" not in attributes
-        assert attributes["snowflake.last_request_id"] == "sf-poll-2"
+        assert "error.snowflake_request_id" not in attributes
         assert attributes["snowflake.request_ids"] == ["sf-poll-1", "sf-poll-2"]
 
     def test_non_http_failure_logs_request_id_without_telemetry(
@@ -985,7 +985,7 @@ class TestOperationMetrics:
                 c.poll_request("job-1", "r1")
 
         assert any(
-            "poll_request failed (last snowflake request id: sf-poll-1)" in r.getMessage()
+            "[last snowflake request id: sf-poll-1] poll_request failed" in r.getMessage()
             for r in caplog.records
         )
 
@@ -1017,8 +1017,7 @@ class TestOperationMetrics:
         assert not [r for r in caplog.records if "sf-prev" in r.getMessage()]
         attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
         assert attributes["error.http_status"] == 502
-        assert "snowflake.request_id" not in attributes
-        assert "snowflake.last_request_id" not in attributes
+        assert "error.snowflake_request_id" not in attributes
         assert attributes["snowflake.request_ids"] == ["sf-prev"]
 
     def test_validation_error_after_lookup_is_not_blamed_on_the_lookup(
@@ -1044,9 +1043,9 @@ class TestOperationMetrics:
         assert not [r for r in caplog.records if "sf-getjob" in r.getMessage()]
         attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
         assert attributes["error.type"] == "ValueError"
-        assert "snowflake.request_id" not in attributes
+        assert "error.snowflake_request_id" not in attributes
         # Recorded only as history, never as the failing request.
-        assert attributes["snowflake.last_request_id"] == "sf-getjob"
+        assert attributes["snowflake.request_ids"] == ["sf-getjob"]
 
     def test_retried_attempts_record_every_request_id(self, monkeypatch):
         c = _make_client()
@@ -1068,10 +1067,10 @@ class TestOperationMetrics:
             c.step("job-1")
 
         message = str(excinfo.value)
-        assert message.endswith("(snowflake request id: sf-3)")
+        assert message.startswith("[snowflake request id: sf-3] ")
         assert message.count("snowflake request id") == 1
         attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
-        assert attributes["snowflake.request_id"] == "sf-3"
+        assert attributes["error.snowflake_request_id"] == "sf-3"
         assert attributes["snowflake.request_ids"] == ["sf-1", "sf-2", "sf-3"]
 
     def test_nested_operation_accumulates_ids_with_one_warning(
@@ -1090,9 +1089,9 @@ class TestOperationMetrics:
             with pytest.raises(RuntimeError, match="boom"):
                 c.wait_for_job("job-1")
 
-        warnings = [r.getMessage() for r in caplog.records if "failed (" in r.getMessage()]
+        warnings = [r.getMessage() for r in caplog.records if "last snowflake request id" in r.getMessage()]
         assert warnings == [
-            "wait_for_job failed (last snowflake request id: sf-job-2): "
+            "[last snowflake request id: sf-job-2] wait_for_job failed: "
             "Job job-1 reached terminal state 'failed': boom"
         ]
         c._metric_emitter.emit.assert_called_once()
@@ -1120,8 +1119,8 @@ class TestOperationMetrics:
             with pytest.raises(nc.ChunkGroupConflictError) as excinfo:
                 c.forward_backward("j1", b"small")
 
-        assert str(excinfo.value).endswith("(snowflake request id: sf-chunk)")
-        assert not [r for r in caplog.records if "failed (" in r.getMessage()]
+        assert str(excinfo.value).startswith("[snowflake request id: sf-chunk] ")
+        assert not [r for r in caplog.records if "last snowflake request id" in r.getMessage()]
 
     def test_untracked_send_still_tags_http_errors(self):
         c = _make_client()
@@ -1132,12 +1131,12 @@ class TestOperationMetrics:
 
         with pytest.raises(
             nc.requests.exceptions.HTTPError,
-            match=r"\(snowflake request id: sf-raw\)$",
+            match=r"^\[snowflake request id: sf-raw\] ",
         ):
             c._send("GET", "http://test.local/raw")
         assert getattr(c._operation_metric_state, "active", set()) == set()
 
-    def test_success_event_records_last_request_id(self, monkeypatch):
+    def test_success_event_records_request_id_history(self, monkeypatch):
         monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
         c = _make_client(post_json={"request_id": "r1"})
         c._session.post.return_value.headers = {"x-snowflake-request-id": "sf-ok"}
@@ -1146,9 +1145,23 @@ class TestOperationMetrics:
         assert c.step("job-1") == "r1"
 
         attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
-        assert "snowflake.request_id" not in attributes
-        assert attributes["snowflake.last_request_id"] == "sf-ok"
+        assert "error.snowflake_request_id" not in attributes
         assert attributes["snowflake.request_ids"] == ["sf-ok"]
+
+    def test_request_id_survives_error_message_truncation(self):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        response = _make_error_response({"code": "BAD"}, 400)
+        response.url = "http://test.local/" + "x" * 1000
+        response.headers["x-snowflake-request-id"] = "sf-long"
+        c._session.post.return_value = response
+
+        with pytest.raises(nc.requests.exceptions.HTTPError):
+            c.step("job-1")
+
+        _, value = c._metric_emitter.emit.call_args.args
+        assert len(value["error_message"]) == nc._METRIC_ERROR_MESSAGE_LIMIT
+        assert value["error_message"].startswith("[snowflake request id: sf-long] ")
 
     def test_tracked_request_ids_are_bounded(self, monkeypatch):
         c = _make_client()
@@ -1167,7 +1180,6 @@ class TestOperationMetrics:
             c.poll_request("job-1", "r1")
 
         attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
-        assert attributes["snowflake.last_request_id"] == f"sf-{total}"
         assert attributes["snowflake.request_ids"] == [
             f"sf-{index}" for index in range(6, total + 1)
         ]

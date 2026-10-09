@@ -1627,7 +1627,7 @@ def test_format_error_leaves_other_http_errors_unchanged() -> None:
 
 def test_format_error_does_not_repeat_request_id_already_in_message() -> None:
     exc = FakeHTTPError()
-    exc.args = (f"{exc.args[0]} (snowflake request id: sf-req-1)",)
+    exc.args = (f"[snowflake request id: sf-req-1] {exc.args[0]}",)
 
     message = cli._format_error(exc)
 
