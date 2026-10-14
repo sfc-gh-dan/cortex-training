@@ -2146,7 +2146,6 @@ class TestPollRetryBudget:
         )
 
         assert c.poll_request("job-1", "req-1") == {"loss": 1.5}
-        # More attempts than max_retries allows, and no single wait above 10s.
         assert c._session.get.call_count > c.max_retries + 1
         assert clock.t >= 120.0
         assert max(clock.slept) <= 10.0

@@ -304,13 +304,7 @@ class _DefaultTimeoutSession(requests.Session):
 
 
 def _counts_toward_max_retries(exc: BaseException) -> bool:
-    """Whether a retried GET failure is bounded by ``max_retries``.
-
-    Reads retry an unavailable service for the whole ``poll_retry_budget``: a
-    backend restart can leave it unreachable for more than a minute. A 404 is
-    the exception, since one that persists usually means the id is wrong or
-    the job is gone, so it keeps the attempt cap.
-    """
+    """A persistent 404 likely means a bad id, so it keeps the attempt cap."""
     if isinstance(exc, requests.exceptions.HTTPError):
         resp = exc.response
         return resp is not None and resp.status_code == 404
@@ -1744,8 +1738,7 @@ class CortexTrainingClient:
         self.poll_max_interval = poll_max_interval
         self.max_retries = max_retries
         self.poll_retry_budget = poll_retry_budget
-        # Deadline of the wait_for_job / poll_request loop on this thread, if
-        # any; GET retries inside the loop stop when it passes.
+        # Per-thread poll deadline that also ends GET retries (see _poll_deadline).
         self._poll_deadline_state = threading.local()
         self._fwd_bwd_send_count = 0
         self._fwd_bwd_request_debug: dict[str, dict[str, Any]] = {}
@@ -2098,12 +2091,8 @@ class CortexTrainingClient:
         displayed_max_attempts = max_attempts + (
             1 if self._auth_provider is not None else 0
         )
-        # A GET only reads, so repeating it is safe: it retries until a time
-        # budget runs out rather than for a fixed number of attempts, which
-        # lets a poll survive the service being unavailable for minutes.
-        # Everything else (POST, DELETE) may duplicate work when repeated and
-        # keeps the attempt cap, as does a call that passes its own
-        # ``max_retries`` or a client built with ``max_retries=0``.
+        # Reads are safe to repeat, so they retry for a time budget; writes
+        # keep the attempt cap since repeating them can apply them twice.
         budget_deadline: float | None = None
         budget_seconds = 0.0
         if method.upper() == "GET" and max_retries is None and retry_limit > 0:
@@ -2113,7 +2102,6 @@ class CortexTrainingClient:
             if poll_deadline is not None:
                 budget_deadline = min(budget_deadline, poll_deadline)
             budget_seconds = max(budget_deadline - started, 0.0)
-        # Debug lines print "attempt=N/M"; a time budget has no fixed M.
         attempts_shown = (
             "?" if budget_deadline is not None else str(displayed_max_attempts)
         )
@@ -2284,7 +2272,6 @@ class CortexTrainingClient:
         def wait(retry_state: RetryCallState) -> float:
             delay = backoff(retry_state)
             if budget_deadline is not None:
-                # Don't sleep past the end of the budget.
                 delay = min(delay, max(budget_deadline - time.monotonic(), 0.0))
             return delay
 

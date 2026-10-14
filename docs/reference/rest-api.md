@@ -254,27 +254,17 @@ Redirects are never followed; a 307 or 308 is retried on the original URL.
 Capacity is the exception: it is attempted once with the shorter bounds
 documented in [section 5.4](#54-capacity---get-capacity).
 
-Retries back off with exponential jitter: 0.5 seconds at first, never more than
-10 seconds between attempts. Each retry is logged as a warning naming the
-attempt number and the time spent so far.
+Retries use exponential jitter (0.5 seconds initial, 10 seconds cap). How
+long they last depends on the method:
 
-How long the client keeps retrying depends on the HTTP method:
+- **`GET`** (get job, list jobs, request status, list checkpoints, experiment
+  run): retries until `poll_retry_budget` (default 300 seconds) runs out,
+  ending no later than `poll_timeout` inside `poll_request()` /
+  `wait_for_job()`. A persistent `404` still stops after `max_retries`.
+- **`POST` / `DELETE`**: `max_retries` (default 10) retries after the first
+  attempt.
 
-- **`GET` requests** (get job, list jobs, request status, list checkpoints,
-  experiment run) only read, so they retry for a time budget rather than a
-  number of attempts: `poll_retry_budget`, 300 seconds by default. Inside
-  `poll_request()` and `wait_for_job()` the budget also ends when the poll
-  loop's `poll_timeout` does. A backend restart can make the service
-  unavailable for over a minute, longer than a fixed ten attempts last, and
-  a poll should outlast it. A `404` is still limited to `max_retries`
-  retries within the budget, because a `404` that persists usually means the
-  id is wrong or the job is gone.
-- **Every other method** (`POST`, `DELETE`) keeps an attempt cap of
-  `max_retries` retries after the first attempt (10 by default). Repeating a
-  request that changes state can apply it twice, so its retries are not
-  stretched over a longer window.
-
-With `max_retries=0` no request is retried, including `GET`s.
+`max_retries=0` disables all retries.
 
 Create-job uses the narrower connection-establishment retry predicate so an
 ambiguous response does not accidentally create a second server-assigned job.
