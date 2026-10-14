@@ -1163,6 +1163,108 @@ class TestOperationMetrics:
         assert len(value["error_message"]) == nc._METRIC_ERROR_MESSAGE_LIMIT
         assert value["error_message"].startswith("[snowflake request id: sf-long] ")
 
+    def test_undecodable_server_payload_logs_last_request_id(
+        self, monkeypatch, caplog
+    ):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        response = _make_error_response({"status": "done"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-bad-payload"
+        c._session.get.return_value = response
+
+        def bad_payload(_status):
+            raise nc.wire.WireError("not a valid DSSST1 safetensors payload")
+
+        monkeypatch.setattr(c, "_decode_stream_result_events", bad_payload)
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(nc.wire.WireError):
+                c.poll_request("job-1", "r1")
+
+        assert any(
+            "[last snowflake request id: sf-bad-payload] poll_request failed"
+            in r.getMessage()
+            for r in caplog.records
+        )
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["error.type"] == "WireError"
+        assert attributes["snowflake.request_ids"] == ["sf-bad-payload"]
+
+    @pytest.mark.parametrize("status", ["done", "cancelled"])
+    def test_wait_for_job_non_failed_terminal_state_logs_nothing(
+        self, monkeypatch, caplog, status
+    ):
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        response = _make_error_response({"status": status, "reason": "r"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-job"
+        c._session.get.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match=f"terminal state '{status}'"):
+                c.wait_for_job("job-1")
+
+        assert not [
+            r for r in caplog.records if "last snowflake request id" in r.getMessage()
+        ]
+        # Telemetry keeps the history even when nothing is logged.
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["snowflake.request_ids"] == ["sf-job"]
+
+    def test_poll_request_cancelled_logs_nothing(self, monkeypatch, caplog):
+        c = _make_client()
+        monkeypatch.setattr(nc.time, "sleep", lambda *_: None)
+        response = _make_error_response({"status": "cancelled"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-poll"
+        c._session.get.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(RuntimeError, match="cancelled"):
+                c.poll_request("job-1", "r1")
+
+        assert not [
+            r for r in caplog.records if "last snowflake request id" in r.getMessage()
+        ]
+
+    def test_poll_request_timeout_logs_last_request_id(self, monkeypatch, caplog):
+        c = _make_client()
+        c.poll_interval = 0.01
+        c.poll_max_interval = 0.01
+        c.poll_timeout = 0.05
+        response = _make_error_response({"status": "running"}, 200)
+        response.headers["x-snowflake-request-id"] = "sf-running"
+        c._session.get.return_value = response
+
+        with caplog.at_level("WARNING", logger=nc.logger.name):
+            with pytest.raises(TimeoutError):
+                c.poll_request("job-1", "r1")
+
+        assert any(
+            "[last snowflake request id: sf-running] poll_request failed"
+            in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_session_expired_401_request_id_is_recorded(self, monkeypatch):
+        monkeypatch.setenv(nc.ENABLE_SUCCESS_TELEMETRY_ENV, "1")
+        c = _make_client()
+        c._metric_emitter = MagicMock()
+        expired = _make_error_response({"code": "390112"}, status_code=401)
+        expired.headers["x-snowflake-request-id"] = "sf-401"
+        succeeded = _make_response({"job_id": "j1"})
+        succeeded.headers = {"x-snowflake-request-id": "sf-ok"}
+        c._session.get.side_effect = [expired, succeeded]
+        auth = MagicMock()
+        auth.get_token.side_effect = ["old-token", "new-token"]
+        c._auth_provider = auth
+
+        assert c.get_job("j1") == {"job_id": "j1"}
+
+        auth.refresh.assert_called_once_with("old-token")
+        attributes = c._metric_emitter.emit.call_args.kwargs["attributes"]
+        assert attributes["snowflake.request_ids"] == ["sf-401", "sf-ok"]
+
     def test_tracked_request_ids_are_bounded(self, monkeypatch):
         c = _make_client()
         c._metric_emitter = MagicMock()

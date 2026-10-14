@@ -37,6 +37,7 @@ use the ``extra`` fields for anything the typed layer does not model yet.
 from __future__ import annotations
 
 import base64
+import contextlib
 import functools
 import gzip
 import hashlib
@@ -59,6 +60,7 @@ from enum import Enum
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
+from typing import TypeVar
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
@@ -384,29 +386,63 @@ def _snowflake_request_attributes(
     return attributes
 
 
+_E = TypeVar("_E", bound=BaseException)
+_SERVER_FAILURE_ATTR = "_snowflake_server_failure"
+
+
+def _server_failure(exc: _E, failed: bool = True) -> _E:
+    """Mark ``exc`` as caused by a server outcome when ``failed`` is true.
+
+    Marked errors (a request or job that ended ``failed``, a poll that timed
+    out, a response payload that could not be decoded) carry no response of
+    their own, so :func:`_log_untagged_request_id` names the operation's last
+    Snowflake request id for them.
+    """
+    if failed:
+        try:
+            setattr(exc, _SERVER_FAILURE_ATTR, True)
+        except Exception:
+            pass
+    return exc
+
+
+@contextlib.contextmanager
+def _server_payload() -> Iterator[None]:
+    """Treat decode errors in the enclosed code as server failures."""
+    try:
+        yield
+    except ValueError as exc:
+        raise _server_failure(exc)
+
+
 def _log_untagged_request_id(
     operation: str,
     exc: BaseException,
     request_ids: list[str],
 ) -> None:
-    """Log the last Snowflake request id for a failure whose error carries none.
+    """Log the last Snowflake request id for a server-side failure with no response.
 
     This is the fallback for :func:`_add_snowflake_request_id_to_error`, which
-    tags any error that has a response. It covers errors with no response at
-    all, such as a poll that ended ``failed``, a timeout, or a connection
-    error after retries. It logs ``request_ids[-1]`` labeled "last" because
-    that request did not necessarily fail.
+    tags any error that has a response. It covers:
 
-    It logs nothing when the operation made no Snowflake requests, when the error
-    has a response (already tagged, or the response lacked the header), or for
-    client-side ``ValueError``/``TypeError`` raised after an earlier request
-    succeeded.
+    - transport errors with no response, such as a connection error or
+      timeout after retries;
+    - errors marked by :func:`_server_failure`: a request or job that ended
+      ``failed``, a poll that timed out, or an undecodable response payload.
+
+    It logs ``request_ids[-1]`` labeled "last" because that request did not
+    necessarily fail. It logs nothing when the operation made no Snowflake
+    requests, when the error has a response (already tagged, or the response
+    lacked the header), or for any other error, such as client-side
+    validation or a job that reached ``done`` or ``cancelled``. Telemetry
+    still records ``snowflake.request_ids`` for those.
     """
     try:
         if getattr(exc, "response", None) is not None or not request_ids:
             return
-        if isinstance(exc, (ValueError, TypeError)) and not isinstance(
-            exc, requests.exceptions.RequestException
+        if not (
+            isinstance(exc, requests.exceptions.RequestException)
+            or getattr(exc, _SERVER_FAILURE_ATTR, False)
         ):
             return
         request_id = request_ids[-1]
@@ -1670,16 +1706,6 @@ class CortexTrainingClient:
                         )
                     raise
 
-                if (
-                    self._auth_provider is not None
-                    and not auth_retry_used
-                    and _is_session_auth_expired_response(resp)
-                ):
-                    auth_retry_used = True
-                    resp.close()
-                    self._auth_provider.refresh(observed_token)
-                    continue
-
                 status_code = getattr(resp, "status_code", None)
                 sf_request_id = _response_snowflake_request_id(resp)
                 if sf_request_id:
@@ -1702,6 +1728,17 @@ class CortexTrainingClient:
                             "client operation request id tracking failed",
                             exc_info=True,
                         )
+
+                if (
+                    self._auth_provider is not None
+                    and not auth_retry_used
+                    and _is_session_auth_expired_response(resp)
+                ):
+                    auth_retry_used = True
+                    resp.close()
+                    self._auth_provider.refresh(observed_token)
+                    continue
+
                 if debug_label is not None:
                     try:
                         status_int = int(status_code)
@@ -1890,9 +1927,14 @@ class CortexTrainingClient:
                 return job
             if status in ("failed", "done", "cancelled", "canceled"):
                 reason = job.get("reason", "")
-                raise RuntimeError(f"Job {job_id} reached terminal state '{status}': {reason}")
+                raise _server_failure(
+                    RuntimeError(f"Job {job_id} reached terminal state '{status}': {reason}"),
+                    failed=status == "failed",
+                )
             delay = self._sleep_with_backoff(delay, deadline)
-        raise TimeoutError(f"Job {job_id} did not become running within {self.poll_timeout}s")
+        raise _server_failure(
+            TimeoutError(f"Job {job_id} did not become running within {self.poll_timeout}s")
+        )
 
     @_track_operation("get_job")
     def get_job(self, job_id: str) -> dict:
@@ -3039,7 +3081,8 @@ class CortexTrainingClient:
             events = status.get("events") or []
             received_chunk = False
             for event in events:
-                chunk = self._decode_result_chunk_event(event)
+                with _server_payload():
+                    chunk = self._decode_result_chunk_event(event)
                 if chunk is not None:
                     result_chunks.append(chunk)
                     received_chunk = True
@@ -3050,10 +3093,12 @@ class CortexTrainingClient:
                 continue
             if state in ("completed", "done", "succeeded"):
                 if result_chunks:
-                    result = wire.decode_result_chunks(result_chunks)
+                    with _server_payload():
+                        result = wire.decode_result_chunks(result_chunks)
                 else:
                     result = status.get("result") or {}
-                    decoded = self._decode_result_payload(result)
+                    with _server_payload():
+                        decoded = self._decode_result_payload(result)
                     if decoded is not None:
                         result = decoded
                 result = self._normalize_generate_result_if_needed(request_id, result)
@@ -3078,7 +3123,10 @@ class CortexTrainingClient:
                     )
                     self._fwd_bwd_request_debug.pop(request_id, None)
                 self._generate_request_ids.discard(request_id)
-                raise RuntimeError(f"Request {request_id} ended with state '{state}': {error}")
+                raise _server_failure(
+                    RuntimeError(f"Request {request_id} ended with state '{state}': {error}"),
+                    failed=state == "failed",
+                )
             if received_chunk:
                 # Defensive: if the server returns a chunk without next_cursor
                 # before terminal status, poll again immediately rather than
@@ -3089,7 +3137,9 @@ class CortexTrainingClient:
             logger.debug("%s timed out after %ss", debug_label, self.poll_timeout)
             self._fwd_bwd_request_debug.pop(request_id, None)
         self._generate_request_ids.discard(request_id)
-        raise TimeoutError(f"Request {request_id} did not complete within {self.poll_timeout}s")
+        raise _server_failure(
+            TimeoutError(f"Request {request_id} did not complete within {self.poll_timeout}s")
+        )
 
     @_track_operation("get_request_status")
     def get_request_status(
@@ -3112,7 +3162,8 @@ class CortexTrainingClient:
             params=params or None,
             debug_context=debug_context,
         )
-        return self._decode_stream_result_events(resp.json())
+        with _server_payload():
+            return self._decode_stream_result_events(resp.json())
 
     @_track_operation("cancel_request")
     def cancel_request(
