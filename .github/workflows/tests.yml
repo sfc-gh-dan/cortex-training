@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -36,8 +36,9 @@ jobs:
         # The recipe tests import tinker-cookbook and wandb; install them the
         # way recipes/README.md does. CPU-only torch keeps the job small.
         run: |
-          uv venv
-          uv pip install --index-strategy unsafe-best-match \
+          python -m pip install uv
+          python -m uv venv --python "$(command -v python)"
+          python -m uv pip install --index-strategy unsafe-best-match \
             --extra-index-url https://download.pytorch.org/whl/cpu \
             -e ".[dev]" \
             'tinker-cookbook[math-rl] @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@nightly' \
